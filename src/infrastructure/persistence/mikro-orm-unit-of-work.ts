@@ -117,6 +117,7 @@ export class MikroOrmUnitOfWork implements WageringUnitOfWork {
         failureCode: r.failureCode,
         referenceTransactionId: r.referenceTransactionId,
         resultBalanceAmount: r.resultBalanceAmount,
+        resultBalanceCurrency: r.resultBalanceCurrency,
         referenceAttempts: r.referenceAttempts,
         nextReferenceCheckAt: r.nextReferenceCheckAt,
         processedAt: r.processedAt,

@@ -34,9 +34,9 @@ beforeAll(async () => {
     await tx`insert into wallets (id, player_id, currency, balance_amount, version, created_at, updated_at)
              values (${W}, 'p-1', 'BRL', 100.00, 1, now(), now())`;
     await tx`insert into wager_transactions (id, provider_id, external_transaction_id, idempotency_key, payload_hash, wallet_id,
-               player_id, round_id, game_id, kind, amount, currency, status, result_balance_amount, created_at, processed_at)
+               player_id, round_id, game_id, kind, amount, currency, status, result_balance_amount, result_balance_currency, created_at, processed_at)
              values (${TX_OPEN}, 'internal', 'opening:w1', 'internal:opening:w1', ${hash}, ${W}, 'p-1', 'opening', 'internal',
-               'OPENING', 100.00, 'BRL', 'PROCESSED', 100.00, now(), now())`;
+               'OPENING', 100.00, 'BRL', 'PROCESSED', 100.00, 'BRL', now(), now())`;
     await tx`insert into wallet_ledger_entries (id, wallet_id, transaction_id, direction, amount, currency, balance_before, balance_after, wallet_version, created_at)
              values (gen_random_uuid(), ${W}, ${TX_OPEN}, 'CREDIT', 100.00, 'BRL', 0.00, 100.00, 1, now())`;
   });
@@ -56,6 +56,7 @@ describe('migrations', () => {
         (await odb`select count(*)::int as n from information_schema.tables where table_schema = 'public' and table_name <> 'mikro_orm_migrations'`)[0].n;
       expect(await tables()).toBe(6);
       expect(await runMigrations(other, 'down-all')).toEqual([
+        'reverted Migration20261120000003_ledger_transaction_integrity',
         'reverted Migration20261120000002_outbox_sequence',
         'reverted Migration20261120000001_initial_schema',
       ]);
@@ -65,6 +66,7 @@ describe('migrations', () => {
       expect(await runMigrations(other, 'up')).toEqual([
         'applied Migration20261120000001_initial_schema',
         'applied Migration20261120000002_outbox_sequence',
+        'applied Migration20261120000003_ledger_transaction_integrity',
       ]);
       const [{ n: seqColumn }] = await odb`select count(*)::int as n from information_schema.columns where table_name = 'outbox_messages' and column_name = 'seq'`;
       expect(seqColumn).toBe(1);
@@ -104,15 +106,15 @@ describe('wallets', () => {
 describe('wager_transactions', () => {
   const insertTx = (id: string, extId: string, key: string, failureCode: string | null = 'INSUFFICIENT_FUNDS') =>
     db.unsafe(`insert into wager_transactions (id, provider_id, external_transaction_id, idempotency_key, payload_hash, wallet_id,
-               player_id, round_id, game_id, kind, amount, currency, status, failure_code, result_balance_amount, created_at, processed_at)
+               player_id, round_id, game_id, kind, amount, currency, status, failure_code, result_balance_amount, result_balance_currency, created_at, processed_at)
              values ('${id}', 'provider-a', '${extId}', '${key}', '${hash}', '${W}', 'p-1', 'r', 'g', 'BET', 10.00, 'BRL',
-               'REJECTED', ${failureCode ? `'${failureCode}'` : 'null'}, 100.00, now(), now())`);
+               'REJECTED', ${failureCode ? `'${failureCode}'` : 'null'}, 100.00, 'BRL', now(), now())`);
 
   test('idempotency_key is globally unique and (provider_id, external_transaction_id) is unique', async () => {
     await db.unsafe(`insert into wager_transactions (id, provider_id, external_transaction_id, idempotency_key, payload_hash, wallet_id,
-               player_id, round_id, game_id, kind, amount, currency, status, failure_code, result_balance_amount, created_at, processed_at)
+               player_id, round_id, game_id, kind, amount, currency, status, failure_code, result_balance_amount, result_balance_currency, created_at, processed_at)
              values ('${TX_BET}', 'provider-a', 'ext-1', 'key-1', '${hash}', '${W}', 'p-1', 'r', 'g', 'BET', 10.00, 'BRL',
-               'REJECTED', 'INSUFFICIENT_FUNDS', 100.00, now(), now())`);
+               'REJECTED', 'INSUFFICIENT_FUNDS', 100.00, 'BRL', now(), now())`);
     await expectSqlError(() => insertTx(crypto.randomUUID(), 'ext-2', 'key-1'), /wager_tx_idempotency_key_unique/);
     await expectSqlError(() => insertTx(crypto.randomUUID(), 'ext-1', 'key-2'), /wager_tx_provider_external_unique/);
   });
@@ -142,15 +144,16 @@ describe('wager_transactions', () => {
   });
 
   test('a transaction can be reverted only once (partial unique index)', async () => {
-    const mk = (kind: string, ext: string) =>
-      db.unsafe(`insert into wager_transactions (id, provider_id, external_transaction_id, idempotency_key, payload_hash, wallet_id,
-               player_id, round_id, game_id, kind, amount, currency, status, result_balance_amount, created_at, processed_at,
+    const mk = (tx: SQL, kind: string, ext: string) =>
+      tx.unsafe(`insert into wager_transactions (id, provider_id, external_transaction_id, idempotency_key, payload_hash, wallet_id,
+               player_id, round_id, game_id, kind, amount, currency, status, result_balance_amount, result_balance_currency, created_at, processed_at,
                reference_external_transaction_id, reference_transaction_id)
              values (gen_random_uuid(), 'provider-a', '${ext}', '${ext}', '${hash}', '${W}', 'p-1', 'r', 'g', '${kind}', 10.00, 'BRL',
-               'PROCESSED', 100.00, now(), now(), 'opening:w1', '${TX_OPEN}')`);
-    await mk('ROLLBACK', 'rb-1');
-    await expectSqlError(() => mk('REFUND', 'rf-1'), /wager_tx_single_reversal_uq/);
-    await expectSqlError(() => mk('ROLLBACK', 'rb-2'), /wager_tx_single_reversal_uq/);
+               'PROCESSED', 100.00, 'BRL', now(), now(), 'opening:w1', '${TX_OPEN}')`);
+    // Both reversals in ONE transaction: the partial unique index fires on the second INSERT,
+    // before COMMIT (where the deferred "processed needs a ledger entry" check would also refuse them).
+    await expectSqlError(() => db.begin(async (tx) => { await mk(tx, 'ROLLBACK', 'rb-1'); await mk(tx, 'REFUND', 'rf-1'); }), /wager_tx_single_reversal_uq/);
+    await expectSqlError(() => db.begin(async (tx) => { await mk(tx, 'ROLLBACK', 'rb-2'); await mk(tx, 'ROLLBACK', 'rb-3'); }), /wager_tx_single_reversal_uq/);
   });
 });
 
@@ -198,11 +201,17 @@ describe('wallet_ledger_entries', () => {
     );
   });
 
-  test('a correct movement (wallet + ledger in one transaction) is accepted', async () => {
+  test('a correct movement (PROCESSED BET + wallet + ledger in one transaction) is accepted', async () => {
+    // TX_BET is REJECTED: booking it would be refused (ledger_transaction_check). A real movement needs a PROCESSED BET.
+    const processedBet = '00000000-0000-7000-8000-0000000000b1';
     await db.begin(async (tx) => {
+      await tx`insert into wager_transactions (id, provider_id, external_transaction_id, idempotency_key, payload_hash, wallet_id,
+                 player_id, round_id, game_id, kind, amount, currency, status, result_balance_amount, result_balance_currency, created_at, processed_at)
+               values (${processedBet}, 'provider-a', 'ext-ok', 'key-ok', ${hash}, ${W}, 'p-1', 'r', 'g', 'BET', 10.00, 'BRL',
+                 'PROCESSED', 90.00, 'BRL', now(), now())`;
       await tx`update wallets set balance_amount = 90.00, version = 2 where id = ${W}`;
       await tx`insert into wallet_ledger_entries (id, wallet_id, transaction_id, direction, amount, currency, balance_before, balance_after, wallet_version, created_at)
-               values (gen_random_uuid(), ${W}, ${TX_BET}, 'DEBIT', 10.00, 'BRL', 100.00, 90.00, 2, now())`;
+               values (gen_random_uuid(), ${W}, ${processedBet}, 'DEBIT', 10.00, 'BRL', 100.00, 90.00, 2, now())`;
     });
     const [w] = await db`select balance_amount::text as b, version from wallets where id = ${W}`;
     expect(w).toEqual({ b: '90.00', version: 2 });

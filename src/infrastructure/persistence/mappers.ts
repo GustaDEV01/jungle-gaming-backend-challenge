@@ -53,7 +53,8 @@ export function transactionToDomain(r: WagerTransactionRecord): WagerTransaction
     referenceTransactionId: r.referenceTransactionId ?? undefined,
     failureCode: (r.failureCode ?? undefined) as FailureCode | undefined,
     processedAt: r.processedAt ? date(r.processedAt) : undefined,
-    resultBalance: r.resultBalanceAmount != null ? money(r.resultBalanceAmount, currency) : undefined,
+    // The observed balance is in the WALLET currency (AUD-01), not necessarily the operation currency.
+    resultBalance: r.resultBalanceAmount != null ? money(r.resultBalanceAmount, r.resultBalanceCurrency ?? currency) : undefined,
     referenceAttempts: r.referenceAttempts,
     nextReferenceCheckAt: r.nextReferenceCheckAt ? date(r.nextReferenceCheckAt) : undefined,
   });
@@ -78,6 +79,7 @@ export function transactionToRecord(tx: WagerTransaction, correlationId: string 
     status: tx.status,
     failureCode: tx.failureCode ?? null,
     resultBalanceAmount: tx.resultBalance ? tx.resultBalance.amount : null,
+    resultBalanceCurrency: tx.resultBalance ? tx.resultBalance.currency : null,
     referenceAttempts: tx.referenceAttempts,
     nextReferenceCheckAt: tx.nextReferenceCheckAt ?? null,
     createdAt: tx.createdAt,

@@ -294,6 +294,54 @@ describe('ADV — direct SQL attacks on the ledger (schema as last line of defen
     expect(error).not.toBeNull();
   });
 
+  /** Inserts a wager transaction row directly (bypassing the application). */
+  async function rawTx(tx: SQL, f: { walletId: string; playerId: string }, kind: string, amount: string, extra: { status?: string; result?: string; resultCurrency?: string } = {}) {
+    const id = crypto.randomUUID();
+    const ext = uniqueName('raw');
+    const status = extra.status ?? 'PROCESSED';
+    await tx`insert into wager_transactions (id, provider_id, external_transaction_id, idempotency_key, payload_hash, wallet_id, player_id, round_id, game_id,
+               kind, amount, currency, status, result_balance_amount, result_balance_currency, created_at, processed_at)
+             values (${id}, 'provider-a', ${ext}, ${ext}, ${'b'.repeat(64)}, ${f.walletId}, ${f.playerId}, 'r', 'g',
+               ${kind}, ${amount}, 'BRL', ${status}, ${extra.result ?? '100.00'}, ${extra.resultCurrency ?? 'BRL'}, now(), now())`;
+    return id;
+  }
+  async function move(tx: SQL, walletId: string, txId: string, direction: string, amount: string, before: string, after: string) {
+    await tx`update wallets set balance_amount = ${after}, version = 2 where id = ${walletId}`;
+    await tx`insert into wallet_ledger_entries (id, wallet_id, transaction_id, direction, amount, currency, balance_before, balance_after, wallet_version, created_at)
+             values (gen_random_uuid(), ${walletId}, ${txId}, ${direction}, ${amount}, 'BRL', ${before}, ${after}, 2, now())`;
+  }
+
+  test('ADV-16: ledger amount different from the transaction amount is refused', async () => {
+    const f = await fixture();
+    expect(await attempt(async (tx) => move(tx, f.walletId, await rawTx(tx, f, 'WIN', '10.00', { result: '1100.00' }), 'CREDIT', '1000.00', '100.00', '1100.00'))).toMatch(/differs from transaction/);
+  });
+
+  test('ADV-17: a PROCESSED balance-moving transaction without its ledger entry is refused', async () => {
+    const f = await fixture();
+    expect(await attempt(async (tx) => rawTx(tx, f, 'BET', '10.00', { result: '90.00' }))).toMatch(/has no ledger entry/);
+  });
+
+  test('ADV-18: a ledger entry for a LOSS is refused', async () => {
+    const f = await fixture();
+    expect(await attempt(async (tx) => move(tx, f.walletId, await rawTx(tx, f, 'LOSS', '5.00', { result: '105.00' }), 'CREDIT', '5.00', '100.00', '105.00'))).toMatch(/LOSS transaction/);
+  });
+
+  test('ADV-19: a WIN booked as DEBIT (wrong direction) is refused', async () => {
+    const f = await fixture();
+    expect(await attempt(async (tx) => move(tx, f.walletId, await rawTx(tx, f, 'WIN', '10.00', { result: '90.00' }), 'DEBIT', '10.00', '100.00', '90.00'))).toMatch(/direction DEBIT is not valid/);
+  });
+
+  test('ADV-20: an observed balance stored in a currency other than the wallet currency is refused', async () => {
+    const f = await fixture();
+    expect(await attempt(async (tx) => rawTx(tx, f, 'BET', '10.00', { status: 'REJECTED', resultCurrency: 'USD' }))).not.toBeNull();
+  });
+
+  test('ADV-21: control — a correct movement written directly (PROCESSED WIN + CREDIT + wallet update) is accepted', async () => {
+    const f = await fixture();
+    expect(await attempt(async (tx) => move(tx, f.walletId, await rawTx(tx, f, 'WIN', '10.00', { result: '110.00' }), 'CREDIT', '10.00', '100.00', '110.00'))).toBeNull();
+    expect((await reconcile(app.url, f.walletId)).consistent).toBe(true);
+  });
+
   test('ADV-11: balance changes through UPDATE alone, DELETE/UPDATE/TRUNCATE of the ledger and deletion of transactions are refused', async () => {
     const f = await fixture();
     expect(await attempt(async (tx) => tx`update wallets set balance_amount = 5000.00, version = 2 where id = ${f.walletId}`)).not.toBeNull();

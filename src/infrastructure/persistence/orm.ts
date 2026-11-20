@@ -2,6 +2,7 @@ import { MikroORM, PostgreSqlDriver, defineConfig } from '@mikro-orm/postgresql'
 import { Migrator } from '@mikro-orm/migrations';
 import { Migration20261120000001_initial_schema } from './migrations/Migration20261120000001_initial_schema';
 import { Migration20261120000002_outbox_sequence } from './migrations/Migration20261120000002_outbox_sequence';
+import { Migration20261120000003_ledger_transaction_integrity } from './migrations/Migration20261120000003_ledger_transaction_integrity';
 import { ALL_SCHEMAS } from './schemas';
 
 export const MIKRO_ORM = Symbol('MIKRO_ORM');
@@ -10,6 +11,7 @@ export const MIKRO_ORM = Symbol('MIKRO_ORM');
 export const MIGRATIONS = [
   { name: 'Migration20261120000001_initial_schema', class: Migration20261120000001_initial_schema },
   { name: 'Migration20261120000002_outbox_sequence', class: Migration20261120000002_outbox_sequence },
+  { name: 'Migration20261120000003_ledger_transaction_integrity', class: Migration20261120000003_ledger_transaction_integrity },
 ];
 
 export function ormConfig(databaseUrl: string, poolMax = 20) {
