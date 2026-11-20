@@ -50,6 +50,7 @@ jobs:
       - run: bun run test:integration
       - run: bun run test:concurrency
       - run: bun run test:distributed
+      - run: bun run test:adversarial
 
   # The delivered docker compose: 3 instances behind real PostgreSQL + LocalStack, smoke test,
   # then the full suite inside the compose network.

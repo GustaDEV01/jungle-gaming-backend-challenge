@@ -14,7 +14,7 @@ RUN bun run typecheck && bun run build
 # Image used by `docker compose --profile test run tests`: full sources + dev deps.
 FROM build AS test
 ENV NODE_ENV=test
-CMD ["bun", "test", "--timeout", "240000", "test/unit", "test/integration", "test/concurrency", "test/distributed"]
+CMD ["bun", "test", "--timeout", "240000", "test/unit", "test/integration", "test/concurrency", "test/distributed", "test/adversarial"]
 
 FROM oven/bun:1.4.5-slim AS prod-deps
 WORKDIR /app
