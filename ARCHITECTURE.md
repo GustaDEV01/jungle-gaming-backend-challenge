@@ -191,7 +191,7 @@ Os triggers de acoplamento fazem apenas buscas O(1) por índice (nenhuma soma gl
 - Eventos são gravados em `outbox_messages` **na mesma transação** que a transação/saldo/ledger/inbox. Nada é publicado antes do commit (o publisher só enxerga linhas commitadas — testado com uma transação aberta segurando uma linha).
 - `OutboxPublisher` (em todas as instâncias):
   1. **claim**: um único statement auto-commit `UPDATE ... FROM (SELECT ... FOR UPDATE SKIP LOCKED LIMIT n)` empurra `next_attempt_at` para frente (lease `OUTBOX_LEASE_MS`). Publishers concorrentes nunca pegam a mesma linha ao mesmo tempo;
-  2. **publica** em `wagering-events.fifo` (`MessageGroupId = aggregateId`, `MessageDeduplicationId = eventId`);
+  2. **publica** em `wagering-events.fifo` (`MessageGroupId = aggregateId`, `MessageDeduplicationId = eventId`) em *lanes* paralelas (`OUTBOX_PUBLISH_CONCURRENCY`, padrão 4): todos os eventos de um agregado caem na mesma lane (hash do `aggregateId`) e, dentro dela, os lotes de 10 seguem a ordem de ocorrência (UUID v7). Se um lote falha, o resto da lane é reagendado junto com ele, para não ultrapassar o evento que falhou;
   3. **marca** `published_at`; falha → `attempts+1` e `next_attempt_at` com backoff exponencial (`OutboxMessage.scheduleRetry`).
 - Crash entre 1 e 3: o lease expira e outra instância publica. Entrega **at-least-once**: uma publicação duplicada carrega o **mesmo `eventId`** e corpo idêntico; o broker FIFO descarta duplicatas na janela de 5 min e o consumidor deve deduplicar por `eventId`.
 - Não há limite de tentativas na outbox: evento confirmado nunca é descartado; o atraso é visível em `wagering_outbox_oldest_pending_age_seconds` / `wagering_outbox_pending_messages` (outbox lag).
@@ -321,7 +321,7 @@ Ver [README § Testes](README.md#testes). Pontos de método:
 - Autenticação não implementada (seção 13).
 - Moeda única por wallet; o modelo é multi-moeda (wallet por moeda) e os conflitos de moeda são testados, mas não há conversão.
 - Ledger de entrada simples (partidas dobradas não implementadas).
-- Ordenação dos eventos publicados por agregado é em melhor esforço quando há falha parcial de um lote; consumidores devem deduplicar por `eventId` e usar `walletVersion` para ordem.
+- Ordem dos eventos por agregado: preservada dentro de um claim (lanes) e após falha (o resto da lane espera). Entre **instâncias diferentes** que reivindicam eventos do mesmo agregado em ciclos próximos, a ordem de chegada ao broker não é garantida; consumidores devem deduplicar por `eventId` e ordenar por `walletVersion`.
 - `FAILED` só é atribuído pelo worker de referências (erro permanente); falhas permanentes no caminho síncrono retornam `500` sem persistir (nada foi commitado).
-- Sem teste de carga formal (`test:load`).
+- Teste de carga (`bun run test:load`, [docs/LOAD_TEST.md](docs/LOAD_TEST.md)) é de execução única, em loop fechado, com gerador e infraestrutura na mesma máquina.
 - Validação local do autor feita sem Docker (máquina sem virtualização): PostgreSQL 17 nativo e um servidor SQS compatível; a validação em containers (PostgreSQL + LocalStack) é feita pelo CI (`.github/workflows/ci.yml`) e pelo perfil `test` do compose.
