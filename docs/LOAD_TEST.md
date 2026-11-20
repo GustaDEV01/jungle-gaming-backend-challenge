@@ -36,6 +36,24 @@ Ambiente: runner `ubuntu-latest` (2 vCPU, 7 GB). Na **mesma VM** rodam PostgreSQ
 | Consumidor downstream | 8.617 mensagens recebidas = **8.617 `eventId` únicos** (0 duplicatas, 0 perdas) |
 | Reconciliação | **201/201 wallets consistentes** |
 
+### Resultado 1b — mesma carga depois da ordem estrita por wallet na outbox
+
+Mesmo job e mesmos parâmetros, com o publisher head-of-line (commit `a25200f`): só o evento mais antigo de cada wallet é elegível, e no máximo um evento por wallet vai em cada lote.
+
+| Métrica | 1 (lanes, ordem em melhor esforço) | 1b (ordem estrita) |
+|---|---|---|
+| Throughput | 147,9 req/s | 123,8 req/s |
+| p50 / p95 / p99 | 56 / 1.981 / 4.409 ms | 73 / 2.191 / 5.820 ms |
+| Taxa de erro | 0 | 0 |
+| Lock timeouts / deadlocks | 0 / 0 | 0 / 0 |
+| Outbox: backlog no fim da carga | 86 | 1.090 |
+| Outbox: drenagem após a carga | 1,2 s | 12,7 s |
+| Outbox: lag médio / maior idade pendente | 0,69 s / 9,3 s | 3,37 s / 26,1 s |
+| Consumidor: recebidos = `eventId` únicos | 8.617 = 8.617 | 7.183 = 7.183 (inclui 5 eventos do smoke test) |
+| Reconciliação | 201/201 | 201/201 |
+
+**Leitura honesta**: a ordem estrita custa vazão de publicação **na wallet quente**. Com 20% do tráfego numa única wallet, os eventos dela saem um por rodada (um round-trip ao broker por evento), e o backlog dessa wallet só drena depois que a carga para. As outras wallets não são afetadas, porque cada rodada leva até `OUTBOX_BATCH_SIZE` wallets em paralelo. É o preço de nunca entregar fora de ordem. A diferença de throughput HTTP (148 → 124 req/s) está dentro do ruído de uma VM compartilhada de 2 vCPU: o caminho HTTP não mudou. Para reduzir o lag da wallet quente sem perder a ordem: `SendMessage` em pipeline por grupo, mais lotes por rodada para wallets diferentes, ou aceitar consumidores que reordenam por `walletVersion` e voltar ao modo por lanes.
+
 ## Resultado 2 — máquina local do autor (sem Docker)
 
 Ambiente: Windows 11, 16 GB, PostgreSQL 17.9 nativo, 3 processos `bun src/main.ts` e um servidor SQS compatível (moto) no lugar do LocalStack, porque esta máquina não tem virtualização para rodar Docker. Execução de 20 s com os mesmos parâmetros.
@@ -54,7 +72,8 @@ Ambiente: Windows 11, 16 GB, PostgreSQL 17.9 nativo, 3 processos `bun src/main.t
 1. **A latência de cauda vem da wallet quente, e isso é esperado.** Com lock pessimista, os 20% do tráfego que vão para a mesma wallet ficam numa fila no PostgreSQL. A vazão dessa wallet fica limitada a 1/(tempo em que o lock fica retido) e as esperas aparecem no p95/p99. As wallets "frias" ficam no p50. É a escolha consciente do desenho: o lock enfileira os escritores, sem retrabalho e sem duplicidade. Com optimistic locking, essa fatia viraria retries e possivelmente erros. Nenhuma espera passou do `lock_timeout` de 5 s, e o pior caso no CI (11 s de máximo) foi saturação de CPU de uma VM de 2 vCPU que também roda banco, broker, 3 apps e o gerador de carga.
 2. **Correção sob carga**: 0 erros, 0 deadlocks, 0 lock timeouts, replays devolvendo o resultado original e todas as wallets reconciliadas. A invariante `balance == Σ ledger` se manteve.
 3. **Outbox**: com LocalStack, a publicação acompanhou a produção (backlog de 86 no fim e drenagem em 1,2 s). O consumidor recebeu exatamente um evento por `eventId`. Duplicatas continuam possíveis por desenho (at-least-once); neste experimento não houve nenhuma.
-4. **O que limita o número absoluto**: CPU compartilhada no CI, conexões por instância (`DB_POOL_MAX=20`) e o tempo em que o lock fica retido. Para ir mais longe: separar o gerador de carga da VM, usar mais vCPUs, PgBouncer em modo transaction e ajustar `OUTBOX_PUBLISH_CONCURRENCY`/`OUTBOX_BATCH_SIZE`.
+4. **Ordem estrita × lag** (resultado 1b): a outbox garante ordem por wallet; a wallet quente paga isso em lag de publicação (12,7 s para drenar após a carga), enquanto as demais seguem em paralelo.
+5. **O que limita o número absoluto**: CPU compartilhada no CI, conexões por instância (`DB_POOL_MAX=20`) e o tempo em que o lock fica retido. Para ir mais longe: separar o gerador de carga da VM, usar mais vCPUs, PgBouncer em modo transaction e ajustar `OUTBOX_PUBLISH_CONCURRENCY`/`OUTBOX_BATCH_SIZE`.
 
 ## Limitações do experimento
 
