@@ -35,6 +35,8 @@ export interface AppConfig {
     enabled: boolean;
     pollIntervalMs: number;
     batchSize: number;
+    /** Parallel publishing lanes (events of one aggregate always share a lane). */
+    publishConcurrency: number;
     leaseMs: number;
     baseDelayMs: number;
     maxDelayMs: number;
@@ -102,7 +104,8 @@ export function loadConfig(env: Env = process.env): AppConfig {
     outbox: {
       enabled: bool(env, 'OUTBOX_PUBLISHER_ENABLED', true),
       pollIntervalMs: int(env, 'OUTBOX_POLL_INTERVAL_MS', 500),
-      batchSize: int(env, 'OUTBOX_BATCH_SIZE', 50),
+      batchSize: int(env, 'OUTBOX_BATCH_SIZE', 100),
+      publishConcurrency: int(env, 'OUTBOX_PUBLISH_CONCURRENCY', 4),
       leaseMs: int(env, 'OUTBOX_LEASE_MS', 30_000),
       baseDelayMs: int(env, 'OUTBOX_RETRY_BASE_MS', 1_000),
       maxDelayMs: int(env, 'OUTBOX_RETRY_MAX_MS', 300_000),

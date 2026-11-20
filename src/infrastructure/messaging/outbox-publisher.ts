@@ -6,6 +6,13 @@ import type { AppConfig } from '../config';
 import type { PromMetrics } from '../observability/metrics';
 import type { FaultInjector } from './fault-injection';
 
+/** Stable lane for an aggregate (djb2). */
+function laneOf(aggregateId: string, lanes: number): number {
+  let h = 5381;
+  for (let i = 0; i < aggregateId.length; i++) h = ((h << 5) + h + aggregateId.charCodeAt(i)) | 0;
+  return Math.abs(h) % lanes;
+}
+
 interface ClaimedRow {
   id: string;
   aggregate_id: string;
@@ -96,7 +103,23 @@ export class OutboxPublisher {
     if (claimed.length === 0) return 0;
     this.faults.crashIf('crash_after_outbox_claim');
 
-    const rows = [...claimed].sort((a, b) => (a.id < b.id ? -1 : 1)); // uuid v7 => occurrence order
+    // Lanes: every event of one aggregate goes to the same lane and lanes run in
+    // parallel. Inside a lane, chunks are sent sequentially in occurrence order
+    // (uuid v7), so per-wallet order is preserved while throughput scales.
+    const rows = [...claimed].sort((a, b) => (a.id < b.id ? -1 : 1));
+    const laneCount = Math.max(1, this.config.publishConcurrency);
+    const lanes = new Map<number, ClaimedRow[]>();
+    for (const row of rows) {
+      const lane = laneOf(row.aggregate_id, laneCount);
+      lanes.set(lane, [...(lanes.get(lane) ?? []), row]);
+    }
+    const counts = await Promise.all([...lanes.values()].map((laneRows) => this.publishLane(em, laneRows)));
+    const published = counts.reduce((a, b) => a + b, 0);
+    if (published > 0) this.logger.debug('outbox published', { count: published, instanceId: this.instanceId });
+    return published;
+  }
+
+  private async publishLane(em: ReturnType<MikroORM['em']['fork']>, rows: ClaimedRow[]): Promise<number> {
     let published = 0;
     for (let i = 0; i < rows.length; i += 10) {
       const chunk = rows.slice(i, i + 10);
@@ -154,8 +177,19 @@ export class OutboxPublisher {
         this.metrics.retry('outbox');
         this.logger.warn('outbox publish failed, retry scheduled', { eventId: id, attempts: message.attempts, error: reason });
       }
+      if (failed.size > 0) {
+        // Keep order: later events of this lane wait for the failed ones (same due time, re-claimed in id order).
+        const rest = rows.slice(i + 10).map((r) => r.id);
+        if (rest.length > 0) {
+          await em.execute(
+            `update outbox_messages set next_attempt_at = (select max(next_attempt_at) from outbox_messages where id = any(?::uuid[]))
+              where id = any(?::uuid[]) and published_at is null`,
+            [`{${[...failed.keys()].join(',')}}`, `{${rest.join(',')}}`],
+          );
+        }
+        break;
+      }
     }
-    if (published > 0) this.logger.debug('outbox published', { count: published, instanceId: this.instanceId });
     return published;
   }
 
