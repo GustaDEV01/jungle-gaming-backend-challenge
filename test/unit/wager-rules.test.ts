@@ -282,7 +282,8 @@ describe('idempotency payload hash', () => {
   });
 
   test('same business payload => same hash regardless of key order, amount scale and idempotency key', () => {
-    const reordered = JSON.parse(JSON.stringify({ money: cmd.money, kind: cmd.kind, ...cmd })) as WagerCommand;
+    const reordered = Object.fromEntries(Object.entries(cmd).reverse()) as unknown as WagerCommand;
+    expect(Object.keys(reordered)[0]).toBe('money');
     expect(wagerPayloadHash(reordered)).toBe(wagerPayloadHash(cmd));
     expect(wagerPayloadHash({ ...cmd, money: { amount: '25', currency: 'BRL' } })).toBe(wagerPayloadHash(cmd));
     expect(wagerPayloadHash({ ...cmd, idempotencyKey: 'other' })).toBe(wagerPayloadHash(cmd));

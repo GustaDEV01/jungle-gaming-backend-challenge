@@ -1,4 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
+import { FailureCode } from '../domain/failure-codes';
 import { WagerSettlement } from '../domain/wager-settlement';
 import { WagerTransaction, WagerTransactionStatus } from '../domain/wager-transaction';
 import { LOGGER, METRICS, type AppLogger, type Metrics } from './observability';
@@ -59,11 +60,32 @@ export class ResolvePendingReferenceUseCase {
       return 'still_pending' as const;
     }, 'wager.resolve_pending_reference');
 
+    this.record(result, transactionId, walletId);
+    return result;
+  }
+
+  /**
+   * Permanent, non-business failure while resolving (e.g. a domain invariant
+   * error on corrupted data): the transaction becomes FAILED with
+   * INTERNAL_PROCESSING_ERROR — terminal and auditable — instead of looping forever.
+   */
+  async markFailed(transactionId: string, walletId: string, reason: string): Promise<void> {
+    await this.runner.run(async (uow) => {
+      const wallet = await uow.lockWallet(walletId);
+      const tx = await uow.lockTransaction(transactionId);
+      if (!wallet || !tx || tx.status !== WagerTransactionStatus.PendingReference) return;
+      tx.fail(FailureCode.InternalProcessingError, this.clock.now());
+      await uow.updateTransaction(tx);
+    }, 'wager.mark_failed');
+    this.metrics.transactionOutcome('FAILED', 'PENDING_REFERENCE_RESOLUTION', 'worker');
+    this.logger.error('pending reference marked FAILED', { transactionId, walletId, reason });
+  }
+
+  private record(result: ResolutionResult, transactionId: string, walletId: string): void {
     if (result === 'still_pending') this.metrics.retry('pending_reference');
     if (result === 'processed' || result === 'rejected' || result === 'expired') {
       this.metrics.transactionOutcome(result === 'processed' ? 'PROCESSED' : 'REJECTED', 'PENDING_REFERENCE_RESOLUTION', 'worker');
       this.logger.info('pending reference resolved', { transactionId, walletId, result });
     }
-    return result;
   }
 }

@@ -1,6 +1,7 @@
 import type { MikroORM } from '@mikro-orm/postgresql';
 import type { AppLogger } from '../../application/observability';
 import type { ResolvePendingReferenceUseCase } from '../../application/resolve-pending-reference.use-case';
+import { DomainError } from '../../domain/errors';
 import type { AppConfig } from '../config';
 
 /**
@@ -63,7 +64,12 @@ export class PendingReferenceWorker {
         const result = await this.resolver.resolve(row.id, row.wallet_id);
         if (result !== 'still_pending' && result !== 'skipped') resolved++;
       } catch (error) {
-        // Lease expiry brings it back; nothing is lost.
+        if (error instanceof DomainError) {
+          // Permanent: retrying cannot help. Terminal FAILED, auditable.
+          await this.resolver.markFailed(row.id, row.wallet_id, error.message).catch(() => undefined);
+          continue;
+        }
+        // Transient: the lease expiry brings it back; nothing is lost.
         this.logger.warn('pending reference resolution failed', { transactionId: row.id, walletId: row.wallet_id, error: (error as Error).message });
       }
     }
