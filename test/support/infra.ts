@@ -226,6 +226,21 @@ export async function sendWager(queueUrl: string, message: ReturnType<typeof wag
   await sendRaw(queueUrl, JSON.stringify(message), String(message.data.walletId));
 }
 
+/** Runs tasks with bounded concurrency (keeps local SQS emulators within their connection backlog). */
+export async function pool<T>(tasks: (() => Promise<T>)[], concurrency = 16): Promise<T[]> {
+  const results: T[] = new Array(tasks.length);
+  let next = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, tasks.length) }, async () => {
+      while (next < tasks.length) {
+        const i = next++;
+        results[i] = await tasks[i]!();
+      }
+    }),
+  );
+  return results;
+}
+
 export async function queueDepth(queueUrl: string): Promise<{ visible: number; inFlight: number }> {
   const res = await sqsClient().send(
     new GetQueueAttributesCommand({ QueueUrl: queueUrl, AttributeNames: ['ApproximateNumberOfMessages', 'ApproximateNumberOfMessagesNotVisible'] }),
