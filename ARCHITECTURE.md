@@ -168,6 +168,8 @@ O schema aplica as garantias sozinho (migração `Migration20261120000001_initia
 | ledger pertence à wallet da transação | FK composta `(transaction_id, wallet_id) → wager_transactions(id, wallet_id)` |
 | sem lost update estrutural | `UNIQUE (wallet_id, wallet_version)`: duas escritas nunca registram a mesma versão |
 | saldo ↔ ledger | *constraint triggers* `DEFERRABLE INITIALLY DEFERRED` verificados no `COMMIT`: toda mudança de saldo (e o saldo de abertura) precisa do lançamento daquela versão terminando naquele saldo; versão muda +1 por mudança e nunca sem mudança; cada lançamento encadeia no anterior (`balance_before = balance_after` da versão anterior) e a wallet atingiu sua versão |
+| ledger ↔ transação (auditoria AUD-02) | *constraint trigger* deferido no INSERT do ledger: a transação do lançamento está `PROCESSED`, não é `LOSS`, tem o mesmo valor e moeda, e a direção bate com o tipo (BET → DEBIT; OPENING/WIN/REFUND → CREDIT; ROLLBACK → inverso da referência). No sentido inverso, toda transação `PROCESSED` que mexe em saldo precisa ter seu lançamento. Moeda do lançamento = moeda da wallet (FK composta `(wallet_id, currency)`) |
+| saldo observado no replay (auditoria AUD-01) | `result_balance_currency` guarda a moeda **da wallet** (que difere da moeda da operação numa rejeição `CURRENCY_MISMATCH`); FK composta para `wallets(id, currency)` e CHECK de pareamento com `result_balance_amount` |
 | dinheiro exato | `numeric(20,2)` em todas as colunas monetárias, mapeado como `decimal` → string |
 | inbox | `PRIMARY KEY (consumer_name, message_id)` |
 

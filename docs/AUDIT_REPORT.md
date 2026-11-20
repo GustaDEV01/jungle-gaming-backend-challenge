@@ -109,3 +109,43 @@ Este documento tem duas partes:
 ### Prontidão (fase 1)
 
 Não há falha eliminatória conhecida. Os dois CRÍTICOS devem ser corrigidos antes da entrega, porque são baratos, localizados e tocam exatamente E4 e E7.
+
+---
+
+## Fase 2 — correções (somente os CRÍTICOS confirmados)
+
+| ID | Correção | Arquivos | Regressão |
+|---|---|---|---|
+| AUD-01 | Coluna `result_balance_currency`, preenchida retroativamente com a moeda da wallet, presa à wallet por FK composta e pareada com o valor por CHECK. O mapper reidrata o saldo observado com essa moeda | `Migration20261120000003_ledger_transaction_integrity.ts`, `schemas.ts`, `mappers.ts`, `mikro-orm-unit-of-work.ts` | ADV-04 (falhava; agora passa), ADV-20 |
+| AUD-02 | No COMMIT (deferido, O(1)): o lançamento exige transação `PROCESSED`, não-`LOSS`, com mesmo valor e moeda e direção coerente com o tipo. Toda transação `PROCESSED` que mexe em saldo exige seu lançamento. A moeda do ledger é a moeda da wallet (FK composta) | mesma migration | ADV-09, ADV-10 (falhavam; agora passam), ADV-16 a ADV-19 e o controle positivo ADV-21 |
+
+Migration nova, **reversível**: `schema-constraints.test.ts` aplica `up → down → up` das três migrations num banco limpo.
+
+### Falso positivo encontrado na suíte existente (E8)
+
+`schema-constraints.test.ts › a correct movement … is accepted` lançava um DÉBITO vinculado a uma BET **REJECTED** e afirmava que era uma movimentação correta, ou seja, codificava o AUD-02 como comportamento esperado. Foi corrigido para usar uma BET `PROCESSED`. O teste de reversão única foi ajustado para continuar exercitando o índice parcial (as duas reversões na mesma transação, onde o índice dispara antes do COMMIT).
+
+### Intermitência investigada (não ignorada)
+
+Na primeira execução completa após as correções, dois testes de `crash-recovery` falharam. Uma execução isolada e uma segunda execução completa passaram. A causa foi encontrada nos logs dos processos reais:
+
+- **O produto se comportou corretamente**: o `rescuer` registrou `duplicate message ignored` para a reentrega;
+- **o teste** esperava a "fila vazia" pela contagem aproximada do emulador, que chegou a 0 com o grupo FIFO ainda travado. As asserções rodaram cerca de 1 s antes da reentrega;
+- o teste que falhou deixou instâncias vivas, e elas publicaram os eventos do teste seguinte, que esperou para sempre.
+
+Correção: o teste passa a esperar o próprio evento de interesse (a duplicata registrada pela inbox), as instâncias são mortas em `finally`, cada teste de publisher começa sem processos remanescentes e as esperas por crash têm limite. Depois disso: 3 execuções isoladas seguidas (4/4 cada) e uma execução completa sem falhas.
+
+### Resultados executados após as correções (local)
+
+| Execução | Resultado |
+|---|---|
+| `bun run test:all` (unit, integration, concurrency, distributed, adversarial) | **189 aprovados, 0 falhas, 2 pulados** (SIGTERM real só roda em Linux; queda do PostgreSQL é destrutiva e roda sob variável de ambiente) |
+| `postgres-outage.test.ts` com `ADV_PG_CTL`/`ADV_PG_DATA` | **1 aprovado** (PostgreSQL parado e reiniciado de verdade) |
+| `crash-recovery.test.ts` isolado, 3× seguidas | 4/4 em cada |
+| `tsc --noEmit` | sem erros |
+
+O resultado do CI (PostgreSQL 17 + LocalStack 4.4 em containers, incluindo a suíte dentro do docker compose) está registrado na seção seguinte.
+
+### Pendências (não corrigidas automaticamente, por regra da auditoria)
+
+AUD-03 (ALTO, desempenho do claim com backlog grande), AUD-04, AUD-05, AUD-06 (MÉDIO), AUD-07 a AUD-10 (BAIXO), conforme a tabela da fase 1.
