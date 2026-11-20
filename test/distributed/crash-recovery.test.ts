@@ -33,6 +33,16 @@ let db: SQL;
 let q: QueueUrls;
 const spawned: Instance[] = [];
 
+/** No instance left over by a previous (possibly failed) test may compete for the outbox claim. */
+async function killAll(): Promise<void> {
+  await Promise.all(spawned.map((i) => i.kill()));
+}
+
+/** Bounded wait: a victim that never reaches its crash point fails fast instead of hanging the suite. */
+async function exitCodeWithin(instance: Instance, ms = 30_000): Promise<number | string> {
+  return Promise.race([instance.exitCode(), Bun.sleep(ms).then(() => `still running after ${ms}ms`)]);
+}
+
 async function spawn(name: string, extra: Record<string, string> = {}): Promise<Instance> {
   const instance = await spawnInstance(t.env, name, extra);
   spawned.push(instance);
@@ -60,7 +70,7 @@ describe('crash recovery', () => {
 
     const msg = wagerMessage({ walletId, playerId, kind: 'BET', amount: '30.00' });
     await sendWager(q.wager, msg);
-    expect(await victim.exitCode()).toBe(137); // died right after COMMIT
+    expect(await exitCodeWithin(victim)).toBe(137); // died right after COMMIT
 
     // committed, but never acked
     const [tx] = await db`select status from wager_transactions where external_transaction_id = ${String(msg.data.externalTransactionId)}`;
@@ -70,26 +80,37 @@ describe('crash recovery', () => {
 
     // another instance takes over after the visibility timeout
     const rescuer = await spawn('rescuer');
-    await waitFor(async () => {
-      const d = await queueDepth(q.wager);
-      return d.visible + d.inFlight === 0;
-    }, 'redelivered message acked', 30_000, 250);
-    const stats = await ledgerStats(db, walletId);
-    expect(stats).toMatchObject({ debits: 1, balance: '70.00' });
-    const [{ n }] = await db`select count(*)::int as n from inbox_messages where message_id = ${msg.messageId}`;
-    expect(n).toBe(1);
-    expect(await metric(rescuer, /^wagering_duplicates_total\{kind="inbox_duplicate"/)).toBeGreaterThanOrEqual(1);
-    await rescuer.kill();
-    await api.kill();
+    try {
+      // Wait for the event of interest itself (the redelivery absorbed by the inbox), not for an
+      // approximate queue count: an emulator may briefly report 0 while a FIFO group is still locked.
+      await waitFor(
+        async () => (await metric(rescuer, /^wagering_duplicates_total\{kind="inbox_duplicate"/)) >= 1,
+        'redelivery absorbed by the inbox',
+        30_000,
+        250,
+      );
+      await waitFor(async () => {
+        const d = await queueDepth(q.wager);
+        return d.visible + d.inFlight === 0;
+      }, 'redelivered message acked', 30_000, 250);
+      const stats = await ledgerStats(db, walletId);
+      expect(stats).toMatchObject({ debits: 1, balance: '70.00' });
+      const [{ n }] = await db`select count(*)::int as n from inbox_messages where message_id = ${msg.messageId}`;
+      expect(n).toBe(1);
+    } finally {
+      await rescuer.kill();
+      await api.kill();
+    }
   });
 
   test('publisher killed after claiming: committed events are published by another instance after the lease', async () => {
+    await killAll();
     await drain(q.events, 500, 3_000);
     const victim = await spawn('pub-victim', { FAULT_INJECTION: 'crash_after_outbox_claim', SQS_CONSUMER_ENABLED: 'false', OUTBOX_POLL_INTERVAL_MS: '1000' });
     const playerId = uniqueName('p');
     // The HTTP response may or may not arrive before the publisher claims and crashes: the commit is what matters.
     await http('POST', `${victim.url}/wallets`, { playerId, initialBalance: { amount: '50.00', currency: 'BRL' } }).catch(() => undefined);
-    expect(await victim.exitCode()).toBe(137);
+    expect(await exitCodeWithin(victim)).toBe(137);
     const [w] = await db`select id from wallets where player_id = ${playerId}`;
     expect(w).toBeDefined();
     const before = await db`select id, published_at from outbox_messages where aggregate_id = ${w.id}`;
@@ -108,11 +129,12 @@ describe('crash recovery', () => {
   });
 
   test('publisher killed after publishing but before marking: re-published with the same eventId (safe duplicate)', async () => {
+    await killAll();
     await drain(q.events, 500, 3_000);
     const victim = await spawn('dup-victim', { FAULT_INJECTION: 'crash_after_publish_before_mark', SQS_CONSUMER_ENABLED: 'false', OUTBOX_POLL_INTERVAL_MS: '1000' });
     const playerId = uniqueName('p');
     await http('POST', `${victim.url}/wallets`, { playerId, initialBalance: { amount: '50.00', currency: 'BRL' } }).catch(() => undefined);
-    expect(await victim.exitCode()).toBe(137);
+    expect(await exitCodeWithin(victim)).toBe(137);
     const [w] = await db`select id from wallets where player_id = ${playerId}`;
     const heir = await spawn('dup-heir', { SQS_CONSUMER_ENABLED: 'false' });
     await waitFor(async () => {
