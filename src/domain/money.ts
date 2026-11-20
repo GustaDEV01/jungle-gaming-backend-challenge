@@ -21,11 +21,12 @@ export const MONEY_SCALE = 2;
 const MAX_INTEGER_DIGITS = 18;
 
 /**
- * Strict decimal grammar: optional minus sign, integer part without leading
- * zeros, optional fraction of 1..2 digits. Rejects "", "NaN", "Infinity",
- * "1e3", "+1", " 1", "1.", ".5", "1.234", "0x10", "01.00".
+ * Strict decimal grammar with a FIXED scale of 2 (README §6.1): optional minus
+ * sign, integer part without leading zeros, exactly two decimal places.
+ * Rejects "", "NaN", "Infinity", "1e3", "+1", " 1", "25", "25.0", "1.", ".5",
+ * "1.234", "0x10", "01.00".
  */
-const DECIMAL_PATTERN = /^-?(0|[1-9]\d*)(\.\d{1,2})?$/;
+const DECIMAL_PATTERN = /^-?(0|[1-9]\d*)\.\d{2}$/;
 const CURRENCY_PATTERN = /^[A-Z]{3}$/;
 
 /**
@@ -41,9 +42,8 @@ export class Money {
   }
 
   /**
-   * Parses a decimal string. Values with fewer than two decimal places are
-   * normalised ("25" -> "25.00"); more than two decimal places are rejected
-   * (never rounded silently).
+   * Parses a decimal string with exactly two decimal places. Anything else
+   * ("25", "25.0", "25.001") is rejected — never normalised, never rounded.
    */
   static from(props: MoneyProps): Money {
     if (props === null || typeof props !== 'object') {
@@ -55,7 +55,7 @@ export class Money {
       throw new InvalidMoneyError('Amount must be a decimal string');
     }
     if (!DECIMAL_PATTERN.test(amount)) {
-      throw new InvalidMoneyError(`Invalid amount "${amount}": expected a decimal string with at most ${MONEY_SCALE} decimal places`);
+      throw new InvalidMoneyError(`Invalid amount "${amount}": expected a decimal string with exactly ${MONEY_SCALE} decimal places, e.g. "25.00"`);
     }
     const integerPart = amount.replace('-', '').split('.')[0] ?? '';
     if (integerPart.length > MAX_INTEGER_DIGITS) {

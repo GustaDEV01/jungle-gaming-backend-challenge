@@ -5,9 +5,15 @@ import { Money } from '../../src/domain/money';
 const brl = (amount: string) => Money.from({ amount, currency: 'BRL' });
 
 describe('Money', () => {
+  test('fixed scale of 2: "25" and "25.0" are rejected, never normalised', () => {
+    expect(() => brl('25')).toThrow(InvalidMoneyError);
+    expect(() => brl('25.0')).toThrow(InvalidMoneyError);
+    expect(() => Money.fromNonNegative({ amount: '7', currency: 'BRL' })).toThrow(InvalidMoneyError);
+  });
+
   test('keeps a fixed scale of 2 and serialises as decimal string', () => {
-    expect(brl('25').toJSON()).toEqual({ amount: '25.00', currency: 'BRL' });
-    expect(brl('25.5').amount).toBe('25.50');
+    expect(brl('25.00').toJSON()).toEqual({ amount: '25.00', currency: 'BRL' });
+    expect(brl('25.50').amount).toBe('25.50');
     expect(brl('0.01').amount).toBe('0.01');
     expect(JSON.stringify(brl('1000.00'))).toBe('{"amount":"1000.00","currency":"BRL"}');
   });
@@ -46,6 +52,9 @@ describe('Money', () => {
     ['1.234'],
     ['0.001'],
     ['1.'],
+    ['25'],
+    ['25.0'],
+    ['0'],
     ['.5'],
     ['01.00'],
     ['0x10'],
@@ -85,7 +94,7 @@ describe('Money', () => {
     expect(brl('0.01').isPositive()).toBe(true);
     expect(brl('79.99').isLessThan(brl('80.00'))).toBe(true);
     expect(brl('80.00').isLessThan(brl('80.00'))).toBe(false);
-    expect(brl('80').equals(brl('80.00'))).toBe(true);
+    expect(brl('80.00').equals(brl('80.00'))).toBe(true);
     expect(brl('80.00').equals(Money.from({ amount: '80.00', currency: 'USD' }))).toBe(false);
   });
 

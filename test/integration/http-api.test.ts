@@ -73,6 +73,8 @@ describe('POST /wagering/transactions — validation', () => {
     ['number amount', { money: { amount: 25.5, currency: 'BRL' } }],
     ['scientific notation', { money: { amount: '2.5e1', currency: 'BRL' } }],
     ['3 decimals', { money: { amount: '1.999', currency: 'BRL' } }],
+    ['no decimals ("25")', { money: { amount: '25', currency: 'BRL' } }],
+    ['one decimal ("25.0")', { money: { amount: '25.0', currency: 'BRL' } }],
     ['OPENING is internal', { kind: 'OPENING' }],
     ['unknown kind', { kind: 'JACKPOT' }],
     ['REFUND without reference', { kind: 'REFUND' }],

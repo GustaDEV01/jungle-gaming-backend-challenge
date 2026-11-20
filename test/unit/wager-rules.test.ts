@@ -285,7 +285,7 @@ describe('idempotency payload hash', () => {
     const reordered = Object.fromEntries(Object.entries(cmd).reverse()) as unknown as WagerCommand;
     expect(Object.keys(reordered)[0]).toBe('money');
     expect(wagerPayloadHash(reordered)).toBe(wagerPayloadHash(cmd));
-    expect(wagerPayloadHash({ ...cmd, money: { amount: '25', currency: 'BRL' } })).toBe(wagerPayloadHash(cmd));
+    expect(() => wagerPayloadHash({ ...cmd, money: { amount: '25', currency: 'BRL' } })).toThrow(); // scale is part of the contract
     expect(wagerPayloadHash({ ...cmd, idempotencyKey: 'other' })).toBe(wagerPayloadHash(cmd));
   });
 

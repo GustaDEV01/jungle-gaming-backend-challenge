@@ -3,11 +3,11 @@ import type { WagerCommand } from '../application/wager-command';
 import type { WagerTransactionKind } from '../domain/wager-transaction';
 
 /**
- * Input contracts shared by HTTP and SQS. Money is a decimal STRING with at
- * most 2 decimal places; numbers are refused (z.string()), so a JSON number
- * like 25.5 never reaches the domain.
+ * Input contracts shared by HTTP and SQS. Money is a decimal STRING with a
+ * fixed scale of exactly 2 decimal places ("25.00"; "25" and "25.0" are 400);
+ * numbers are refused (z.string()), so a JSON number like 25.5 never reaches the domain.
  */
-const AMOUNT = /^(0|[1-9]\d{0,17})(\.\d{1,2})?$/;
+const AMOUNT = /^(0|[1-9]\d{0,17})\.\d{2}$/;
 const id = (max: number) =>
   z
     .string()
@@ -17,7 +17,7 @@ const id = (max: number) =>
 
 export const moneySchema = z
   .object({
-    amount: z.string().regex(AMOUNT, 'decimal string, non-negative, at most 2 decimal places (e.g. "25.00")'),
+    amount: z.string().regex(AMOUNT, 'decimal string, non-negative, exactly 2 decimal places (e.g. "25.00")'),
     currency: z.string().regex(/^[A-Z]{3}$/, 'ISO-4217 alpha code'),
   })
   .strict();
@@ -47,7 +47,7 @@ function crossFieldRules(value: { kind: string; money: { amount: string }; refer
   if (value.referenceExternalTransactionId && value.referenceExternalTransactionId === value.externalTransactionId) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['referenceExternalTransactionId'], message: 'a transaction cannot reference itself' });
   }
-  if (value.kind !== 'LOSS' && /^0(\.0{1,2})?$/.test(value.money.amount)) {
+  if (value.kind !== 'LOSS' && value.money.amount === '0.00') {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['money', 'amount'], message: `${value.kind} amount must be greater than zero` });
   }
 }

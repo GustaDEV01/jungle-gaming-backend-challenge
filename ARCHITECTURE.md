@@ -48,7 +48,7 @@ O domínio não conhece NestJS nem MikroORM: as entidades do ORM são *records* 
 - Gramática estrita `^-?(0|[1-9]\d*)(\.\d{1,2})?$`: rejeita `NaN`, `Infinity`, notação científica, string vazia, espaços, `+`, zeros à esquerda, mais de 2 casas. **Nunca arredonda**: `10.005` é erro, não `10.01`.
 - Até 18 dígitos inteiros (cabe em `numeric(20,2)`); overflow em operações é erro.
 - Operações entre moedas diferentes lançam `CurrencyMismatchError`. `Money.fromNonNegative` é usado nos contratos de entrada.
-- Valores com menos de 2 casas são normalizados (`"25"` → `"25.00"`) — inclusive antes do hash de idempotência.
+- **Escala fixa de 2 casas também na entrada**: `"25"` e `"25.0"` são recusados (`400` no HTTP, DLQ `invalid_contract` na fila), assim como `"25.001"`. O contrato não normaliza: o que entra é exatamente o que é gravado e devolvido.
 - Nos contratos (zod) o valor é `z.string()`: um JSON number (`25.5`) é **400**, nunca chega ao domínio.
 
 ### Wallet (aggregate root)
@@ -166,7 +166,7 @@ Os triggers de acoplamento fazem apenas buscas O(1) por índice (nenhuma soma gl
 
 - `Idempotency-Key` é obrigatório no HTTP (`400 IDEMPOTENCY_KEY_REQUIRED`) e é a fonte da verdade; na fila vem em `data.idempotencyKey`. Default recomendado: `"{providerId}:{externalTransactionId}"`.
 - **Persistente**: a própria linha de `wager_transactions` guarda key, `payload_hash` e o resultado (status, `failureCode`, `referenceTransactionId`, `result_balance_amount`). Nada de cache em memória.
-- **payloadHash** = SHA-256 (hex) do **JSON canônico** do subconjunto de negócio: `providerId, externalTransactionId, playerId, walletId, roundId, gameId, kind, money{amount normalizado para 2 casas, currency}, referenceExternalTransactionId` (omitido se ausente). JSON canônico: chaves ordenadas recursivamente por code unit UTF-16, membros `undefined` omitidos, sem espaços; números são recusados. Header, `messageId`, `occurredAt` e correlation id **não** entram no hash — por isso a mesma operação via HTTP e via SQS é reconhecida como a mesma.
+- **payloadHash** = SHA-256 (hex) do **JSON canônico** do subconjunto de negócio: `providerId, externalTransactionId, playerId, walletId, roundId, gameId, kind, money{amount (sempre com 2 casas, garantido pelo contrato), currency}, referenceExternalTransactionId` (omitido se ausente). JSON canônico: chaves ordenadas recursivamente por code unit UTF-16, membros `undefined` omitidos, sem espaços; números são recusados. Header, `messageId`, `occurredAt` e correlation id **não** entram no hash — por isso a mesma operação via HTTP e via SQS é reconhecida como a mesma.
 - Requisição idêntica → mesmo resultado, `idempotentReplay: true`, mesmo status de negócio (200 para processada; 202/422 preservados), **saldo observado na época** (não o atual).
 - Mesma key com payload diferente → `409 IDEMPOTENCY_KEY_CONFLICT` (nunca replay). Mesmo id externo com outra key → `409 EXTERNAL_TRANSACTION_CONFLICT`.
 - HTTP e SQS usam o mesmo use case; a inbox adicionalmente deduplica a **mensagem** (mesmo `messageId` com payload diferente → DLQ `inbox_payload_conflict`).

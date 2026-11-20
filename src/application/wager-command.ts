@@ -28,7 +28,8 @@ export interface ProcessingMeta {
  * payloadHash = SHA-256 of the canonical JSON of the business fields only.
  * The idempotency key (header / data.idempotencyKey) and transport metadata
  * (messageId, occurredAt, correlation id) are NOT part of it. The amount is
- * normalised to scale 2 first, so "25" and "25.00" hash the same.
+ * re-serialised through Money (always exactly 2 decimal places; the contract
+ * already rejects any other scale), so the hash never depends on formatting.
  */
 export function wagerPayloadHash(cmd: WagerCommand): string {
   const money = Money.from(cmd.money);
