@@ -6,13 +6,6 @@ import type { AppConfig } from '../config';
 import type { PromMetrics } from '../observability/metrics';
 import type { FaultInjector } from './fault-injection';
 
-/** Stable lane for an aggregate (djb2). */
-function laneOf(aggregateId: string, lanes: number): number {
-  let h = 5381;
-  for (let i = 0; i < aggregateId.length; i++) h = ((h << 5) + h + aggregateId.charCodeAt(i)) | 0;
-  return Math.abs(h) % lanes;
-}
-
 interface ClaimedRow {
   id: string;
   aggregate_id: string;
@@ -20,24 +13,37 @@ interface ClaimedRow {
   payload: Record<string, unknown> | string;
   occurred_at: Date | string;
   attempts: number;
+  /** bigint as text: per-aggregate commit order. */
+  seq: string;
 }
 
+type Em = ReturnType<MikroORM['em']['fork']>;
+
 /**
- * Transactional outbox publisher. Safe with N concurrent publishers (any
- * number of instances):
+ * Transactional outbox publisher with STRICT per-aggregate (per-wallet)
+ * ordering, safe with N concurrent publishers (any number of instances).
  *
- * 1. CLAIM — one auto-committed statement selects due rows with
- *    FOR UPDATE SKIP LOCKED and pushes their next_attempt_at forward by a
- *    lease. Concurrent publishers never claim the same row at the same time.
- * 2. PUBLISH to SQS FIFO (MessageGroupId = aggregateId, MessageDeduplicationId = eventId).
- * 3. MARK published (or schedule a retry with exponential backoff).
+ * 1. CLAIM (one auto-committed statement) — "head-of-line" per aggregate:
+ *    only the oldest unpublished event of an aggregate (lowest `seq`) is
+ *    eligible, and only when it is due. Eligible heads are locked with
+ *    FOR UPDATE SKIP LOCKED, and the head plus the next events of the same
+ *    aggregate (up to `maxEventsPerAggregate`) get a lease. While that lease
+ *    (or a retry backoff) is pending on the head, no other publisher can
+ *    publish ANY event of that aggregate — a later event can never overtake
+ *    an earlier one, even across instances or after a failure.
+ * 2. PUBLISH in rounds: round k sends the k-th event of every claimed
+ *    aggregate, so a SendMessageBatch never contains two events of one
+ *    aggregate. Batches of a round go out in parallel; rounds are sequential.
+ *    MessageGroupId = aggregateId, MessageDeduplicationId = eventId.
+ * 3. MARK published. If an event fails it gets a retry with exponential
+ *    backoff, it stays the head, and the rest of that aggregate is held back
+ *    behind it (head-of-line blocking, as FIFO semantics require).
  *
  * If the process dies between 1 and 3 the lease expires and another instance
- * publishes again: delivery is at-least-once. Duplicates are harmless: the
- * broker de-duplicates by eventId within its window and consumers must
- * de-duplicate by eventId (it is stable across re-publications).
- * Events are only ever read from committed rows, so nothing is published
- * before the financial transaction commits.
+ * publishes again: delivery is at-least-once. A re-publication carries the same
+ * eventId and body; the broker drops it within its dedup window and consumers
+ * must de-duplicate by eventId. Only committed rows are ever read, so nothing
+ * is published before the financial transaction commits.
  */
 export class OutboxPublisher {
   private timer?: ReturnType<typeof setTimeout>;
@@ -87,110 +93,152 @@ export class OutboxPublisher {
   async publishOnce(): Promise<number> {
     const em = this.orm.em.fork();
     const claimed = await em.execute<ClaimedRow[]>(
-      `with due as (
-         select id from outbox_messages
-          where published_at is null and next_attempt_at <= now()
-          order by next_attempt_at, id
+      `with heads as (
+         select o.id, o.aggregate_id
+           from outbox_messages o
+          where o.published_at is null
+            and o.next_attempt_at <= now()
+            and not exists (select 1 from outbox_messages p
+                             where p.aggregate_id = o.aggregate_id and p.published_at is null and p.seq < o.seq)
+          order by o.next_attempt_at, o.seq
           limit ?
-          for update skip locked)
+          for update skip locked),
+       batch as (
+         select m.id, row_number() over (partition by m.aggregate_id order by m.seq) as rn
+           from outbox_messages m
+           join heads h on h.aggregate_id = m.aggregate_id
+          where m.published_at is null)
        update outbox_messages o
           set next_attempt_at = now() + (? * interval '1 millisecond')
-         from due where o.id = due.id
-       returning o.id, o.aggregate_id, o.event_type, o.payload, o.occurred_at, o.attempts`,
-      [this.config.batchSize, this.config.leaseMs],
+         from batch
+        where o.id = batch.id and batch.rn <= ?
+       returning o.id, o.aggregate_id, o.event_type, o.payload, o.occurred_at, o.attempts, o.seq::text as seq`,
+      [this.config.batchSize, this.config.leaseMs, this.config.maxEventsPerAggregate],
     );
     await this.sampleBacklog();
     if (claimed.length === 0) return 0;
     this.faults.crashIf('crash_after_outbox_claim');
 
-    // Lanes: every event of one aggregate goes to the same lane and lanes run in
-    // parallel. Inside a lane, chunks are sent sequentially in occurrence order
-    // (uuid v7), so per-wallet order is preserved while throughput scales.
-    const rows = [...claimed].sort((a, b) => (a.id < b.id ? -1 : 1));
-    const laneCount = Math.max(1, this.config.publishConcurrency);
-    const lanes = new Map<number, ClaimedRow[]>();
-    for (const row of rows) {
-      const lane = laneOf(row.aggregate_id, laneCount);
-      lanes.set(lane, [...(lanes.get(lane) ?? []), row]);
+    // Per aggregate, in commit order.
+    const queues = new Map<string, ClaimedRow[]>();
+    for (const row of [...claimed].sort((a, b) => (BigInt(a.seq) < BigInt(b.seq) ? -1 : 1))) {
+      queues.set(row.aggregate_id, [...(queues.get(row.aggregate_id) ?? []), row]);
     }
-    const counts = await Promise.all([...lanes.values()].map((laneRows) => this.publishLane(em, laneRows)));
-    const published = counts.reduce((a, b) => a + b, 0);
-    if (published > 0) this.logger.debug('outbox published', { count: published, instanceId: this.instanceId });
-    return published;
-  }
 
-  private async publishLane(em: ReturnType<MikroORM['em']['fork']>, rows: ClaimedRow[]): Promise<number> {
     let published = 0;
-    for (let i = 0; i < rows.length; i += 10) {
-      const chunk = rows.slice(i, i + 10);
-      const ok: string[] = [];
-      const failed = new Map<string, string>();
-      try {
-        const res = await this.sqs.send(
-          new SendMessageBatchCommand({
-            QueueUrl: this.eventsQueueUrl,
-            Entries: chunk.map((row, idx) => ({
-              Id: `m${idx}`,
-              MessageBody: typeof row.payload === 'string' ? row.payload : JSON.stringify(row.payload),
-              MessageGroupId: row.aggregate_id,
-              MessageDeduplicationId: row.id,
-              MessageAttributes: {
-                eventType: { DataType: 'String', StringValue: row.event_type },
-                eventId: { DataType: 'String', StringValue: row.id },
-              },
-            })),
-          }),
-        );
-        for (const s of res.Successful ?? []) ok.push(chunk[Number.parseInt(s.Id!.slice(1), 10)]!.id);
-        for (const f of res.Failed ?? []) failed.set(chunk[Number.parseInt(f.Id!.slice(1), 10)]!.id, f.Message ?? f.Code ?? 'failed');
-      } catch (error) {
-        for (const row of chunk) failed.set(row.id, (error as Error).message);
+    for (let round = 0; queues.size > 0; round++) {
+      const roundRows: ClaimedRow[] = [];
+      for (const [aggregate, rows] of queues) {
+        const row = rows[round];
+        if (row) roundRows.push(row);
+        else queues.delete(aggregate);
+      }
+      if (roundRows.length === 0) break;
+
+      const chunks: ClaimedRow[][] = [];
+      for (let i = 0; i < roundRows.length; i += 10) chunks.push(roundRows.slice(i, i + 10));
+      const ok: ClaimedRow[] = [];
+      const failed = new Map<string, { row: ClaimedRow; reason: string }>();
+      for (let i = 0; i < chunks.length; i += Math.max(1, this.config.publishConcurrency)) {
+        const group = chunks.slice(i, i + Math.max(1, this.config.publishConcurrency));
+        const results = await Promise.all(group.map((chunk) => this.send(chunk)));
+        for (const r of results) {
+          ok.push(...r.ok);
+          for (const [id, f] of r.failed) failed.set(id, f);
+        }
       }
       this.faults.crashIf('crash_after_publish_before_mark');
 
       if (ok.length > 0) {
         await em.execute(`update outbox_messages set published_at = now(), last_error = null where id = any(?::uuid[]) and published_at is null`, [
-          `{${ok.join(',')}}`,
+          `{${ok.map((r) => r.id).join(',')}}`,
         ]);
         published += ok.length;
         this.metrics.outboxPublished(ok.length);
         const now = Date.now();
-        for (const row of chunk.filter((r) => ok.includes(r.id))) {
-          this.metrics.outboxLag((now - new Date(row.occurred_at).getTime()) / 1000);
-        }
+        for (const row of ok) this.metrics.outboxLag((now - new Date(row.occurred_at).getTime()) / 1000);
       }
-      for (const [id, reason] of failed) {
-        const row = chunk.find((r) => r.id === id)!;
-        const message = OutboxMessage.rehydrate({
-          id,
-          aggregateId: row.aggregate_id,
-          eventType: row.event_type,
-          payload: {},
-          occurredAt: new Date(row.occurred_at),
-          attempts: row.attempts,
-        });
-        message.scheduleRetry(new Date(), { baseDelayMs: this.config.baseDelayMs, maxDelayMs: this.config.maxDelayMs });
-        await em.execute(
-          `update outbox_messages set attempts = ?, next_attempt_at = ?, last_error = ? where id = ? and published_at is null`,
-          [message.attempts, message.nextAttemptAt!, reason.slice(0, 500), id],
-        );
-        this.metrics.retry('outbox');
-        this.logger.warn('outbox publish failed, retry scheduled', { eventId: id, attempts: message.attempts, error: reason });
-      }
-      if (failed.size > 0) {
-        // Keep order: later events of this lane wait for the failed ones (same due time, re-claimed in id order).
-        const rest = rows.slice(i + 10).map((r) => r.id);
-        if (rest.length > 0) {
-          await em.execute(
-            `update outbox_messages set next_attempt_at = (select max(next_attempt_at) from outbox_messages where id = any(?::uuid[]))
-              where id = any(?::uuid[]) and published_at is null`,
-            [`{${[...failed.keys()].join(',')}}`, `{${rest.join(',')}}`],
-          );
-        }
-        break;
+      for (const { row, reason } of failed.values()) {
+        await this.holdBack(em, row, queues.get(row.aggregate_id)?.slice(round + 1) ?? [], reason);
+        queues.delete(row.aggregate_id);
       }
     }
+    if (published > 0) this.logger.debug('outbox published', { count: published, instanceId: this.instanceId });
     return published;
+  }
+
+  private async send(chunk: ClaimedRow[]): Promise<{ ok: ClaimedRow[]; failed: Map<string, { row: ClaimedRow; reason: string }> }> {
+    const ok: ClaimedRow[] = [];
+    const failed = new Map<string, { row: ClaimedRow; reason: string }>();
+    const toSend: ClaimedRow[] = [];
+    for (const row of chunk) {
+      if (this.faults.shouldFailPublish(row.aggregate_id)) failed.set(row.id, { row, reason: 'injected broker rejection' });
+      else toSend.push(row);
+    }
+    if (toSend.length === 0) return { ok, failed };
+    try {
+      const res = await this.sqs.send(
+        new SendMessageBatchCommand({
+          QueueUrl: this.eventsQueueUrl,
+          Entries: toSend.map((row, idx) => ({
+            Id: `m${idx}`,
+            MessageBody: typeof row.payload === 'string' ? row.payload : JSON.stringify(row.payload),
+            MessageGroupId: row.aggregate_id,
+            MessageDeduplicationId: row.id,
+            MessageAttributes: {
+              eventType: { DataType: 'String', StringValue: row.event_type },
+              eventId: { DataType: 'String', StringValue: row.id },
+              sequence: { DataType: 'Number', StringValue: row.seq },
+            },
+          })),
+        }),
+      );
+      for (const s of res.Successful ?? []) ok.push(toSend[Number.parseInt(s.Id!.slice(1), 10)]!);
+      for (const f of res.Failed ?? []) {
+        const row = toSend[Number.parseInt(f.Id!.slice(1), 10)]!;
+        failed.set(row.id, { row, reason: f.Message ?? f.Code ?? 'failed' });
+      }
+    } catch (error) {
+      for (const row of toSend) failed.set(row.id, { row, reason: (error as Error).message });
+    }
+    return { ok, failed };
+  }
+
+  /**
+   * The failed event is rescheduled with backoff and stays the head of its
+   * aggregate; the events claimed behind it get the same due time, so they are
+   * re-claimed together, in order, once the head is published.
+   */
+  private async holdBack(em: Em, row: ClaimedRow, behind: ClaimedRow[], reason: string): Promise<void> {
+    const message = OutboxMessage.rehydrate({
+      id: row.id,
+      aggregateId: row.aggregate_id,
+      eventType: row.event_type,
+      payload: {},
+      occurredAt: new Date(row.occurred_at),
+      attempts: row.attempts,
+    });
+    message.scheduleRetry(new Date(), { baseDelayMs: this.config.baseDelayMs, maxDelayMs: this.config.maxDelayMs });
+    await em.execute(`update outbox_messages set attempts = ?, next_attempt_at = ?, last_error = ? where id = ? and published_at is null`, [
+      message.attempts,
+      message.nextAttemptAt!,
+      reason.slice(0, 500),
+      row.id,
+    ]);
+    if (behind.length > 0) {
+      await em.execute(`update outbox_messages set next_attempt_at = ? where id = any(?::uuid[]) and published_at is null`, [
+        message.nextAttemptAt!,
+        `{${behind.map((r) => r.id).join(',')}}`,
+      ]);
+    }
+    this.metrics.retry('outbox');
+    this.logger.warn('outbox publish failed, retry scheduled', {
+      eventId: row.id,
+      aggregateId: row.aggregate_id,
+      attempts: message.attempts,
+      heldBack: behind.length,
+      error: reason,
+    });
   }
 
   private async sampleBacklog(): Promise<void> {

@@ -70,7 +70,8 @@ Variáveis principais (ver [.env.example](.env.example) e [src/infrastructure/co
 | `SQS_MAX_RECEIVE_COUNT` | `5` | tentativas antes da DLQ |
 | `SQS_VISIBILITY_TIMEOUT_SECONDS` | `30` | visibilidade de mensagens em processamento |
 | `OUTBOX_LEASE_MS` | `30000` | lease do claim da outbox (recuperação após crash) |
-| `OUTBOX_PUBLISH_CONCURRENCY` | `4` | lanes paralelas de publicação (ordem por wallet preservada) |
+| `OUTBOX_BATCH_SIZE` / `OUTBOX_MAX_EVENTS_PER_AGGREGATE` | `100` / `20` | wallets por claim / eventos por wallet por claim |
+| `OUTBOX_PUBLISH_CONCURRENCY` | `4` | lotes `SendMessageBatch` em paralelo por rodada (ordem por wallet garantida) |
 | `PENDING_REFERENCE_MAX_ATTEMPTS` / `PENDING_REFERENCE_TTL_MS` | `10` / `900000` | orçamento de espera por referência |
 | `SQS_CONSUMER_ENABLED`, `OUTBOX_PUBLISHER_ENABLED`, `PENDING_REFERENCE_WORKER_ENABLED` | `true` | liga/desliga workers por instância |
 
@@ -181,6 +182,6 @@ test/               unit | integration | concurrency | distributed | support
 
 - Autenticação não implementada (ponto de extensão `ProviderIdentityPort` + `ProviderAuthGuard`); desenho proposto no ARCHITECTURE.md.
 - Uma wallet por transação (sem partidas dobradas).
-- Ordenação de eventos publicados é por agregado em melhor esforço; consumidores devem deduplicar por `eventId` e ordenar por `walletVersion`.
+- Ordem de eventos garantida por wallet (não global); entrega at-least-once — consumidores deduplicam por `eventId`.
 - Teste de carga (`bun run test:load`) é um experimento de execução única; metodologia, números e limitações em [docs/LOAD_TEST.md](docs/LOAD_TEST.md).
 - Ver lista completa em [ARCHITECTURE.md § Limitações](ARCHITECTURE.md#limitações).

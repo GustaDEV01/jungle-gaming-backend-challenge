@@ -34,8 +34,11 @@ export interface AppConfig {
   outbox: {
     enabled: boolean;
     pollIntervalMs: number;
+    /** Aggregates (wallets) claimed per cycle. */
     batchSize: number;
-    /** Parallel publishing lanes (events of one aggregate always share a lane). */
+    /** Events of one aggregate claimed per cycle (published in order, one per round). */
+    maxEventsPerAggregate: number;
+    /** SendMessageBatch calls in flight per round (each batch has distinct aggregates). */
     publishConcurrency: number;
     leaseMs: number;
     baseDelayMs: number;
@@ -105,6 +108,7 @@ export function loadConfig(env: Env = process.env): AppConfig {
       enabled: bool(env, 'OUTBOX_PUBLISHER_ENABLED', true),
       pollIntervalMs: int(env, 'OUTBOX_POLL_INTERVAL_MS', 500),
       batchSize: int(env, 'OUTBOX_BATCH_SIZE', 100),
+      maxEventsPerAggregate: int(env, 'OUTBOX_MAX_EVENTS_PER_AGGREGATE', 20),
       publishConcurrency: int(env, 'OUTBOX_PUBLISH_CONCURRENCY', 4),
       leaseMs: int(env, 'OUTBOX_LEASE_MS', 30_000),
       baseDelayMs: int(env, 'OUTBOX_RETRY_BASE_MS', 1_000),

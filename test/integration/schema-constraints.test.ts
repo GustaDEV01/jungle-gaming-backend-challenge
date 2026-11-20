@@ -55,11 +55,19 @@ describe('migrations', () => {
       const tables = async () =>
         (await odb`select count(*)::int as n from information_schema.tables where table_schema = 'public' and table_name <> 'mikro_orm_migrations'`)[0].n;
       expect(await tables()).toBe(6);
-      expect(await runMigrations(other, 'down-all')).toEqual(['reverted Migration20261120000001_initial_schema']);
+      expect(await runMigrations(other, 'down-all')).toEqual([
+        'reverted Migration20261120000002_outbox_sequence',
+        'reverted Migration20261120000001_initial_schema',
+      ]);
       expect(await tables()).toBe(0);
       const [{ n: functions }] = await odb`select count(*)::int as n from pg_proc p join pg_namespace s on s.oid = p.pronamespace where s.nspname = 'public'`;
       expect(functions).toBe(0);
-      expect(await runMigrations(other, 'up')).toEqual(['applied Migration20261120000001_initial_schema']);
+      expect(await runMigrations(other, 'up')).toEqual([
+        'applied Migration20261120000001_initial_schema',
+        'applied Migration20261120000002_outbox_sequence',
+      ]);
+      const [{ n: seqColumn }] = await odb`select count(*)::int as n from information_schema.columns where table_name = 'outbox_messages' and column_name = 'seq'`;
+      expect(seqColumn).toBe(1);
       expect(await tables()).toBe(6);
       await odb.close();
     } finally {
