@@ -1,0 +1,118 @@
+name: wagering
+
+x-app-env: &app-env
+  DATABASE_URL: postgresql://postgres:postgres@postgres:5432/wagering
+  SQS_ENDPOINT: http://localstack:4566
+  AWS_REGION: us-east-1
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+  SQS_WAGER_QUEUE: wager-transactions.fifo
+  SQS_WAGER_DLQ: wager-transactions-dlq.fifo
+  SQS_EVENTS_QUEUE: wagering-events.fifo
+  DB_POOL_MAX: "20"
+  LOG_LEVEL: info
+  PORT: "3000"
+
+x-app: &app
+  build:
+    context: .
+    target: runtime
+  image: wagering-processor:local
+  environment: *app-env
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    localstack:
+      condition: service_healthy
+  restart: unless-stopped
+  stop_grace_period: 20s
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: wagering
+    command: ["postgres", "-c", "max_connections=300"]
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d wagering"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  localstack:
+    # Pinned community image (no auth token required). Only SQS is enabled.
+    image: localstack/localstack:4.4
+    environment:
+      SERVICES: sqs
+      SQS_ENDPOINT_STRATEGY: path
+      EAGER_SERVICE_LOADING: "1"
+    ports:
+      - "4566:4566"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health > /dev/null"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
+  # One-shot: versioned migrations, then exits (the app containers wait for it).
+  migrate:
+    build:
+      context: .
+      target: runtime
+    image: wagering-processor:local
+    environment: *app-env
+    command: ["bun", "dist/infrastructure/persistence/migrate.js", "up"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Three instances of the same service (README §8: >= 3 instances).
+  app-1:
+    <<: *app
+    environment:
+      <<: *app-env
+      INSTANCE_ID: app-1
+    ports:
+      - "3001:3000"
+  app-2:
+    <<: *app
+    environment:
+      <<: *app-env
+      INSTANCE_ID: app-2
+    ports:
+      - "3002:3000"
+  app-3:
+    <<: *app
+    environment:
+      <<: *app-env
+      INSTANCE_ID: app-3
+    ports:
+      - "3003:3000"
+
+  # Full test suite against the real PostgreSQL and LocalStack containers:
+  #   docker compose --profile test run --rm tests
+  tests:
+    profiles: ["test"]
+    build:
+      context: .
+      target: test
+    environment:
+      TEST_PG_URL: postgresql://postgres:postgres@postgres:5432
+      SQS_ENDPOINT: http://localstack:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+
+volumes:
+  pgdata:

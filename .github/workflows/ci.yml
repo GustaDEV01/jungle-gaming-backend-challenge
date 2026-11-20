@@ -1,0 +1,68 @@
+name: ci
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  # Typecheck, build and the whole suite against real PostgreSQL + LocalStack service containers.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 2s --health-timeout 3s --health-retries 30
+      localstack:
+        image: localstack/localstack:4.4
+        env:
+          SERVICES: sqs
+          SQS_ENDPOINT_STRATEGY: path
+          EAGER_SERVICE_LOADING: "1"
+        ports: ["4566:4566"]
+        options: >-
+          --health-cmd "curl -sf http://localhost:4566/_localstack/health" --health-interval 2s --health-timeout 3s --health-retries 60
+    env:
+      TEST_PG_URL: postgresql://postgres:postgres@localhost:5432
+      SQS_ENDPOINT: http://localhost:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.5
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun run build
+      - name: Raise PostgreSQL max_connections
+        run: |
+          docker exec ${{ job.services.postgres.id }} psql -U postgres -c "alter system set max_connections = 300"
+          docker restart ${{ job.services.postgres.id }}
+          for i in $(seq 1 30); do docker exec ${{ job.services.postgres.id }} pg_isready -U postgres && break; sleep 1; done
+      - run: bun run test:unit
+      - run: bun run test:integration
+      - run: bun run test:concurrency
+      - run: bun run test:distributed
+
+  # The delivered docker compose: 3 instances behind real PostgreSQL + LocalStack, smoke test,
+  # then the full suite inside the compose network.
+  compose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose up -d --build
+      - name: Smoke test across the three instances
+        run: bash scripts/smoke.sh
+      - run: docker compose --profile test run --rm tests
+      - if: always()
+        run: docker compose logs --no-color | tail -n 300
+      - if: always()
+        run: docker compose down -v
