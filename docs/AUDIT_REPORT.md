@@ -149,3 +149,13 @@ O resultado do CI (PostgreSQL 17 + LocalStack 4.4 em containers, incluindo a su�
 ### Pendências (não corrigidas automaticamente, por regra da auditoria)
 
 AUD-03 (ALTO, desempenho do claim com backlog grande), AUD-04, AUD-05, AUD-06 (MÉDIO), AUD-07 a AUD-10 (BAIXO), conforme a tabela da fase 1.
+
+### Resultado do CI desta branch (containers reais)
+
+Execução `44819185793`, commit `2fa4e40`, todos os jobs com `success`:
+
+| Job | Ambiente | Resultado |
+|---|---|---|
+| `test` | service containers PostgreSQL 17 + LocalStack 4.4 | unit 76, integration 76, concurrency 8, distributed 10 (inclui SIGTERM real), adversarial 20 + 1 pulado (queda do PostgreSQL, opt-in) → **190 aprovados, 0 falhas** |
+| `compose` | `docker compose up` (3 instâncias) + smoke + suíte no perfil `test` | smoke OK; **190 aprovados, 1 pulado, 0 falhas** |
+| `load` | 3 instâncias do compose | 103 req/s, taxa de erro 0, outbox drenada 12,2 s após a carga, 6.053 `eventId` únicos, 201/201 wallets consistentes |
