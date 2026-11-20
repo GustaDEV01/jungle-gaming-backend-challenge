@@ -104,7 +104,20 @@ Interpretações documentadas:
 
 1. **Uma transação é revertida no máximo uma vez, por qualquer tipo de reversão.** O enunciado diz "não pode ser revertida duas vezes pelo mesmo tipo"; aplicamos a regra mais forte porque `REFUND` + `ROLLBACK` sobre a mesma `BET` creditariam o valor duas vezes (crédito duplicado é eliminatório). Garantido no domínio (`isReversed`) e no schema (índice único parcial `wager_tx_single_reversal_uq` sobre `reference_transaction_id` para `REFUND/ROLLBACK PROCESSED`).
 2. **REFUND × ROLLBACK concorrentes sobre a mesma referência**: ambos travam a mesma wallet, portanto são serializados; o primeiro a obter o lock é aplicado, o segundo vê a reversão já commitada e é `REJECTED` com `REFERENCE_ALREADY_REVERSED`. Se, por hipótese, dois escapassem do lock, o índice único parcial faria o segundo commit falhar (rollback completo) — testado em `wallet-concurrency.test.ts`.
-3. `ROLLBACK` de um `REFUND` é permitido (debita o reembolso). Depois disso a `BET` original continua "revertida uma vez" e não pode ser reembolsada novamente.
+3. `ROLLBACK` de um `REFUND` é permitido (debita o reembolso). Depois disso a `BET` original continua "revertida uma vez" e não pode ser reembolsada novamente. Um `ROLLBACK` não pode ser revertido (`INVALID_REFERENCE_KIND`).
+
+   **Por que a regra é "uma reversão por transação" e não "uma por tipo".** Exemplo com saldo inicial de 100,00:
+
+   | # | Operação | Leitura literal "por tipo" | Regra adotada |
+   |---|---|---|---|
+   | 1 | `BET` 40,00 | 60,00 | 60,00 |
+   | 2 | `REFUND` da BET 1 | 100,00 | 100,00 |
+   | 3 | `ROLLBACK` da BET 1 | **140,00** (outro tipo, seria aceito: crédito duplicado) | 100,00 — `REJECTED REFERENCE_ALREADY_REVERSED` |
+   | 4 | `ROLLBACK` do REFUND 2 | — | 60,00 (debita o reembolso; aposta volta a valer) |
+   | 5 | `REFUND` da BET 1 de novo | — | 60,00 — `REJECTED REFERENCE_ALREADY_REVERSED` |
+   | 6 | `ROLLBACK` do REFUND 2 de novo | — | 60,00 — `REJECTED REFERENCE_ALREADY_REVERSED` |
+
+   Na leitura literal, os passos 2 e 3 devolveriam a mesma aposta duas vezes. A regra adotada garante que cada transação produz no máximo um lançamento de reversão. O efeito líquido de qualquer cadeia BET → REFUND → ROLLBACK(REFUND) fica sempre igual a zero ou a um único débito da aposta, nunca negativo para a casa. Testes: `wager-rules.test.ts` (cadeia e contraexemplo), `reversals.test.ts` (banco real, 10 ROLLBACKs concorrentes do mesmo REFUND → 1 débito), `wallet-concurrency.test.ts` (REFUND×ROLLBACK concorrentes, 15×) e `schema-constraints.test.ts` (o índice recusa a segunda reversão mesmo sem a aplicação).
 4. `WIN` que referencia uma `BET` já revertida é rejeitado (`REFERENCE_ALREADY_REVERSED`): não se paga prêmio de aposta cancelada.
 5. `WIN`/`LOSS` sem referência são aceitos (provedores que não correlacionam); com referência, valem as mesmas validações de pertencimento.
 6. Valor zero só é aceito em `LOSS`; nos demais tipos é `400`.

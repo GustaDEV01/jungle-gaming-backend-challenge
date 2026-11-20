@@ -216,6 +216,38 @@ describe('ROLLBACK', () => {
     expect(w.balance.amount).toBe('0.00');
   });
 
+  test('ROLLBACK of a REFUND debits the refund back; the BET stays reverted once; nothing can be reverted twice', () => {
+    const w = wallet('100.00');
+    const bet = processed(K.Bet, '40.00', w); // 60.00
+    const refund = processed(K.Refund, '40.00', w, bet); // 100.00
+    const rbRefund = tx(K.Rollback, '40.00', { referenceExternalTransactionId: refund.externalTransactionId });
+    expect(rbRefund.ledgerDirectionFor(refund)).toBe(LedgerDirection.Debit);
+    expect(WagerSettlement.settle(rbRefund, w, ref(refund), ctx()).type).toBe('processed');
+    expect(w.balance.amount).toBe('60.00'); // the bet is effectively charged again
+
+    // the BET was already reverted (by the REFUND): no second refund and no rollback of it
+    const refundAgain = tx(K.Refund, '40.00', { referenceExternalTransactionId: bet.externalTransactionId });
+    expect(WagerSettlement.settle(refundAgain, w, ref(bet, true), ctx())).toEqual({ type: 'rejected', code: FailureCode.ReferenceAlreadyReversed });
+    // the REFUND was already reverted (by the ROLLBACK)
+    const rbRefundAgain = tx(K.Rollback, '40.00', { referenceExternalTransactionId: refund.externalTransactionId });
+    expect(WagerSettlement.settle(rbRefundAgain, w, ref(refund, true), ctx())).toEqual({ type: 'rejected', code: FailureCode.ReferenceAlreadyReversed });
+    // a ROLLBACK cannot itself be rolled back
+    const rbOfRb = tx(K.Rollback, '40.00', { referenceExternalTransactionId: rbRefund.externalTransactionId });
+    expect(WagerSettlement.settle(rbOfRb, w, ref(rbRefund), ctx())).toEqual({ type: 'rejected', code: FailureCode.InvalidReferenceKind });
+    expect(w.balance.amount).toBe('60.00');
+  });
+
+  test('why "one reversal per transaction" and not "one per kind": REFUND + ROLLBACK of the same BET would credit twice', () => {
+    // Literal per-kind reading: REFUND(BET) and ROLLBACK(BET) are different kinds, both would be allowed.
+    const w = wallet('100.00');
+    const bet = processed(K.Bet, '40.00', w); // 60.00
+    processed(K.Refund, '40.00', w, bet); // 100.00 — the stake is back
+    const rollback = tx(K.Rollback, '40.00', { referenceExternalTransactionId: bet.externalTransactionId });
+    // Under the per-kind reading this would credit +40.00 again => 140.00 for a 100.00 player (duplicate credit).
+    expect(WagerSettlement.settle(rollback, w, ref(bet, true), ctx())).toEqual({ type: 'rejected', code: FailureCode.ReferenceAlreadyReversed });
+    expect(w.balance.amount).toBe('100.00');
+  });
+
   test('ROLLBACK of a LOSS is an invalid reference kind', () => {
     const w = wallet('100.00');
     const loss = processed(K.Loss, '0.00', w);
